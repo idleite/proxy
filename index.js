@@ -157,21 +157,5 @@ process.on('SIGUSR2', () => {
   proxy.close();
   process.exit(0);
 });
-// Handle uncaught exceptions
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-  proxy.close();
-  process.exit(1);
-});
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled rejection at:', promise, 'reason:', reason);
-  proxy.close();
-  process.exit(1);
-});
-// Handle SIGTERM for Docker container shutdown
-process.on('SIGTERM', () => {
-  console.log('Received SIGTERM, shutting down gracefully...');
-  proxy.close();
-  process.exit(0);
-});
+
+
