@@ -15,12 +15,10 @@ const port = 3000;
 // Load users.json for permissions
 let users = JSON.parse(await fs.readFile(path.join(__dirname, 'users.json'), 'utf8'));
 
-// Mapping of Docker API paths to permission flags
 const permissionMap = [
   { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/(stop|restart|kill)$/, flag: 'ALLOW_RESTARTS' },
   { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/start$/, flag: 'ALLOW_START' },
   { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/stop$/, flag: 'ALLOW_STOP' },
-
   { pattern: /^\/v\d+\.\d+\/auth$/, flag: 'AUTH' },
   { pattern: /^\/v\d+\.\d+\/build.*$/, flag: 'BUILD' },
   { pattern: /^\/v\d+\.\d+\/commit.*$/, flag: 'COMMIT' },
@@ -45,73 +43,72 @@ const permissionMap = [
   { pattern: /^\/v\d+\.\d+\/version$/, flag: 'VERSION' },
   { pattern: /^\/v\d+\.\d+\/volumes.*$/, flag: 'VOLUMES' },
   { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/logs$/, flag: 'LOGS' },
-
-
-  // fallback wildcard
   { pattern: /^\/v\d+\.\d+\/.*$/, flag: 'ALL' }
 ];
 
-
-// Match request path to a permission flag
 function getRequiredPermissions(pathname) {
   return permissionMap
     .filter(entry => entry.pattern.test(pathname))
     .map(entry => entry.flag);
 }
 
-// Basic auth middleware
-// app.use(async (req, res, next) => {
-//   const auth = req.headers.authorization || '';
-//   const token = auth.split(' ')[1];
-//   if (!token) return res.status(401).send('Missing auth');
-
-//   const [username, password] = Buffer.from(token, 'base64').toString().split(':');
-//   const user = users[username];
-
-//   if (!user || user.password !== password) {
-//     return res.status(403).send('Invalid credentials');
-//   }
-
-//   req.user = user;
-//   next();
-// });
-// Basic auth middleware
 app.use(async (req, res, next) => {
   const auth = req.headers.authorization || '';
-  if (!auth.startsWith('Basic ')) return res.status(401).send('Missing or invalid auth header');
+  const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+  if (!auth.startsWith('Basic ')) {
+    console.log(`[AUTH FAIL] ${clientIP} - Missing or invalid auth header`);
+    return res.status(401).send('Missing or invalid auth header');
+  }
 
   const token = auth.split(' ')[1];
-  if (!token) return res.status(401).send('Missing auth token');
+  if (!token) {
+    console.log(`[AUTH FAIL] ${clientIP} - Missing auth token`);
+    return res.status(401).send('Missing auth token');
+  }
 
   let credentials;
   try {
     credentials = Buffer.from(token, 'base64').toString();
   } catch {
+    console.log(`[AUTH FAIL] ${clientIP} - Invalid base64`);
     return res.status(400).send('Invalid base64 auth encoding');
   }
 
   const [username, password] = credentials.split(':');
-  if (!username || !password) return res.status(401).send('Malformed credentials');
+  if (!username || !password) {
+    console.log(`[AUTH FAIL] ${clientIP} - Malformed credentials`);
+    return res.status(401).send('Malformed credentials');
+  }
 
   const user = users[username];
   if (!user || user.password !== password) {
+    console.log(`[AUTH FAIL] ${clientIP} - Invalid credentials for user: ${username}`);
     return res.status(403).send('Invalid credentials');
   }
 
-  req.user = user;
+  console.log(`[AUTH OK] ${clientIP} - Authenticated as ${username}`);
+  req.user = { ...user, username };
   next();
 });
 
-
-// Permission check + proxy to Docker socket
 app.use((req, res) => {
   const user = req.user;
-  const requiredPermissions = getRequiredPermissions(req.url);
+  const path = req.url;
+  const method = req.method;
+  const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
+  const requiredPermissions = getRequiredPermissions(path);
   const hasPermission = requiredPermissions.every(flag => user.permissions?.[flag]);
+
+  console.log(`[REQUEST] ${clientIP} - ${method} ${path} - Required: [${requiredPermissions.join(', ')}] - User: ${user.username}`);
+
   if (!hasPermission) {
+    console.log(`[DENIED] ${clientIP} - ${method} ${path} - User: ${user.username}`);
     return res.status(403).send('Permission denied');
   }
+
+  console.log(`[PROXY] ${clientIP} - ${method} ${path} - Forwarding to Docker socket`);
 
   proxy.web(req, res, {
     socketPath: '/var/run/docker.sock',
@@ -119,7 +116,7 @@ app.use((req, res) => {
       socketPath: '/var/run/docker.sock',
     },
   }, (err) => {
-    console.error('Proxy error:', err);
+    console.error(`[ERROR] ${clientIP} - Proxy error:`, err);
     res.status(500).send('Docker proxy error');
   });
 });
@@ -127,35 +124,33 @@ app.use((req, res) => {
 app.listen(port, () => {
   console.log(`Proxy listening on http://localhost:${port}`);
 });
-// Graceful shutdown
+
 process.on('SIGINT', () => {
   console.log('Shutting down gracefully...');
   proxy.close();
   process.exit(0);
 });
-// Handle uncaught exceptions
+
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
   proxy.close();
   process.exit(1);
 });
-// Handle unhandled promise rejections
+
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled rejection at:', promise, 'reason:', reason);
   proxy.close();
   process.exit(1);
 });
-// Handle SIGTERM for Docker container shutdown
+
 process.on('SIGTERM', () => {
   console.log('Received SIGTERM, shutting down gracefully...');
   proxy.close();
   process.exit(0);
 });
-// Handle SIGUSR2 for Docker container restart
+
 process.on('SIGUSR2', () => {
   console.log('Received SIGUSR2, restarting gracefully...');
   proxy.close();
   process.exit(0);
 });
-
-
