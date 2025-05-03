@@ -11,15 +11,13 @@ const app = express();
 const proxy = httpProxy.createProxyServer({});
 const port = 3000;
 
-let server;
-
-// Load users.json for permissions
 let users = JSON.parse(await fs.readFile(path.join(__dirname, 'users.json'), 'utf8'));
 
 const permissionMap = [
   { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/(stop|restart|kill)$/, flag: 'ALLOW_RESTARTS' },
   { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/start$/, flag: 'ALLOW_START' },
   { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/stop$/, flag: 'ALLOW_STOP' },
+
   { pattern: /^\/v\d+\.\d+\/auth$/, flag: 'AUTH' },
   { pattern: /^\/v\d+\.\d+\/build.*$/, flag: 'BUILD' },
   { pattern: /^\/v\d+\.\d+\/commit.*$/, flag: 'COMMIT' },
@@ -53,9 +51,7 @@ function getRequiredPermissions(pathname) {
     .map(entry => entry.flag);
 }
 
-// Basic auth middleware
 app.use(async (req, res, next) => {
-  console.log(`[Auth] Request from ${req.ip} for ${req.url}`);
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Basic ')) return res.status(401).send('Missing or invalid auth header');
 
@@ -74,54 +70,66 @@ app.use(async (req, res, next) => {
 
   const user = users[username];
   if (!user || user.password !== password) {
-    console.log(`[Auth] Invalid credentials for user: ${username}`);
     return res.status(403).send('Invalid credentials');
   }
 
-  console.log(`[Auth] Authenticated user: ${username}`);
   req.user = user;
   next();
 });
 
-// Permission check + proxy to Docker socket
 app.use((req, res) => {
   const user = req.user;
   const requiredPermissions = getRequiredPermissions(req.url);
-
   const hasPermission = requiredPermissions.every(flag => user.permissions?.[flag]);
+
   if (!hasPermission) {
-    console.log(`[Permissions] Denied for user: ${req.user?.username} on ${req.url}`);
+    console.log(`[DENY] ${req.method} ${req.url} for user ${user.username}`);
     return res.status(403).send('Permission denied');
   }
 
-  console.log(`[Proxy] User: ${req.user.username}, URL: ${req.url}`);
+  console.log(`[ALLOW] ${req.method} ${req.url} for user ${user.username}`);
+
   proxy.web(req, res, {
     socketPath: '/var/run/docker.sock',
-    target: { socketPath: '/var/run/docker.sock' }
+    target: {
+      socketPath: '/var/run/docker.sock',
+    },
   }, (err) => {
-    console.error('[Proxy] Error:', err);
+    console.error('Proxy error:', err);
     res.status(500).send('Docker proxy error');
   });
 });
 
-server = app.listen(port, () => {
+const connections = new Set();
+let server = app.listen(port, () => {
   console.log(`Proxy listening on http://localhost:${port}`);
 });
 
-// Graceful shutdown logic
+server.on('connection', (conn) => {
+  connections.add(conn);
+  conn.on('close', () => connections.delete(conn));
+});
+
 function gracefulShutdown(signal) {
   console.log(`[Signal] Received ${signal}`);
-  console.log('[Shutdown] Closing proxy...');
   proxy.close();
 
   if (server) {
-    console.log('[Shutdown] Closing HTTP server...');
     server.close(() => {
-      console.log('[Shutdown] All services closed. Exiting...');
-      setTimeout(() => process.exit(0), 100);
+      console.log('[Shutdown] Server closed');
+      process.exit(0);
     });
+
+    for (const conn of connections) {
+      conn.destroy();
+    }
+
+    setTimeout(() => {
+      console.error('[Shutdown] Force exiting after timeout');
+      process.exit(1);
+    }, 5000);
   } else {
-    setTimeout(() => process.exit(0), 100);
+    process.exit(0);
   }
 }
 
@@ -129,12 +137,16 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2'));
 
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+  gracefulShutdown('unhandledRejection');
+});
 process.on('uncaughtException', (err) => {
-  console.error('[Exception] Uncaught exception:', err);
+  console.error('Uncaught exception:', err);
   gracefulShutdown('uncaughtException');
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[Exception] Unhandled rejection at:', promise, 'reason:', reason);
-  gracefulShutdown('unhandledRejection');
-});
+// Optional debug heartbeat
+setInterval(() => {
+  console.log('[Debug] still alive...');
+}, 10000).unref();
