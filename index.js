@@ -44,6 +44,8 @@ const permissionMap = [
   { pattern: /^\/v\d+\.\d+\/tasks.*$/, flag: 'TASKS' },
   { pattern: /^\/v\d+\.\d+\/version$/, flag: 'VERSION' },
   { pattern: /^\/v\d+\.\d+\/volumes.*$/, flag: 'VOLUMES' },
+  { pattern: /^\/v\d+\.\d+\/containers\/[^/]+\/logs$/, flag: 'LOGS' },
+
 
   // fallback wildcard
   { pattern: /^\/v\d+\.\d+\/.*$/, flag: 'ALL' }
