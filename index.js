@@ -4,13 +4,14 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// __dirname workaround for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const proxy = httpProxy.createProxyServer({});
 const port = 3000;
+
+let server;
 
 // Load users.json for permissions
 let users = JSON.parse(await fs.readFile(path.join(__dirname, 'users.json'), 'utf8'));
@@ -52,105 +53,88 @@ function getRequiredPermissions(pathname) {
     .map(entry => entry.flag);
 }
 
+// Basic auth middleware
 app.use(async (req, res, next) => {
+  console.log(`[Auth] Request from ${req.ip} for ${req.url}`);
   const auth = req.headers.authorization || '';
-  const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-
-  if (!auth.startsWith('Basic ')) {
-    console.log(`[AUTH FAIL] ${clientIP} - Missing or invalid auth header`);
-    return res.status(401).send('Missing or invalid auth header');
-  }
+  if (!auth.startsWith('Basic ')) return res.status(401).send('Missing or invalid auth header');
 
   const token = auth.split(' ')[1];
-  if (!token) {
-    console.log(`[AUTH FAIL] ${clientIP} - Missing auth token`);
-    return res.status(401).send('Missing auth token');
-  }
+  if (!token) return res.status(401).send('Missing auth token');
 
   let credentials;
   try {
     credentials = Buffer.from(token, 'base64').toString();
   } catch {
-    console.log(`[AUTH FAIL] ${clientIP} - Invalid base64`);
     return res.status(400).send('Invalid base64 auth encoding');
   }
 
   const [username, password] = credentials.split(':');
-  if (!username || !password) {
-    console.log(`[AUTH FAIL] ${clientIP} - Malformed credentials`);
-    return res.status(401).send('Malformed credentials');
-  }
+  if (!username || !password) return res.status(401).send('Malformed credentials');
 
   const user = users[username];
   if (!user || user.password !== password) {
-    console.log(`[AUTH FAIL] ${clientIP} - Invalid credentials for user: ${username}`);
+    console.log(`[Auth] Invalid credentials for user: ${username}`);
     return res.status(403).send('Invalid credentials');
   }
 
-  console.log(`[AUTH OK] ${clientIP} - Authenticated as ${username}`);
-  req.user = { ...user, username };
+  console.log(`[Auth] Authenticated user: ${username}`);
+  req.user = user;
   next();
 });
 
+// Permission check + proxy to Docker socket
 app.use((req, res) => {
   const user = req.user;
-  const path = req.url;
-  const method = req.method;
-  const clientIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const requiredPermissions = getRequiredPermissions(req.url);
 
-  const requiredPermissions = getRequiredPermissions(path);
   const hasPermission = requiredPermissions.every(flag => user.permissions?.[flag]);
-
-  console.log(`[REQUEST] ${clientIP} - ${method} ${path} - Required: [${requiredPermissions.join(', ')}] - User: ${user.username}`);
-
   if (!hasPermission) {
-    console.log(`[DENIED] ${clientIP} - ${method} ${path} - User: ${user.username}`);
+    console.log(`[Permissions] Denied for user: ${req.user?.username} on ${req.url}`);
     return res.status(403).send('Permission denied');
   }
 
-  console.log(`[PROXY] ${clientIP} - ${method} ${path} - Forwarding to Docker socket`);
-
+  console.log(`[Proxy] User: ${req.user.username}, URL: ${req.url}`);
   proxy.web(req, res, {
     socketPath: '/var/run/docker.sock',
-    target: {
-      socketPath: '/var/run/docker.sock',
-    },
+    target: { socketPath: '/var/run/docker.sock' }
   }, (err) => {
-    console.error(`[ERROR] ${clientIP} - Proxy error:`, err);
+    console.error('[Proxy] Error:', err);
     res.status(500).send('Docker proxy error');
   });
 });
 
-app.listen(port, () => {
+server = app.listen(port, () => {
   console.log(`Proxy listening on http://localhost:${port}`);
 });
 
-process.on('SIGINT', () => {
-  console.log('Shutting down gracefully...');
+// Graceful shutdown logic
+function gracefulShutdown(signal) {
+  console.log(`[Signal] Received ${signal}`);
+  console.log('[Shutdown] Closing proxy...');
   proxy.close();
-  process.exit(0);
-});
+
+  if (server) {
+    console.log('[Shutdown] Closing HTTP server...');
+    server.close(() => {
+      console.log('[Shutdown] All services closed. Exiting...');
+      setTimeout(() => process.exit(0), 100);
+    });
+  } else {
+    setTimeout(() => process.exit(0), 100);
+  }
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2'));
 
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-  proxy.close();
-  process.exit(1);
+  console.error('[Exception] Uncaught exception:', err);
+  gracefulShutdown('uncaughtException');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled rejection at:', promise, 'reason:', reason);
-  proxy.close();
-  process.exit(1);
-});
-
-process.on('SIGTERM', () => {
-  console.log('Received SIGTERM, shutting down gracefully...');
-  proxy.close();
-  process.exit(0);
-});
-
-process.on('SIGUSR2', () => {
-  console.log('Received SIGUSR2, restarting gracefully...');
-  proxy.close();
-  process.exit(0);
+  console.error('[Exception] Unhandled rejection at:', promise, 'reason:', reason);
+  gracefulShutdown('unhandledRejection');
 });
